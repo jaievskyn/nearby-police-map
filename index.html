@@ -49,17 +49,37 @@
       </div>
       <button id="refresh" class="btn" disabled>Refresh data</button>
     </div>
+      <div class="controls" style="margin-left:auto; gap:8px">
+      <div class="field">Scanner URL
+        <input id="scannerUrl" type="text" placeholder="https://example.com/public-scanner-stream.mp3" size="36" />
+      </div>
+      <button id="scannerBtn" class="btn">Play scanner</button>
+    </div>
   </header>
 
   <div id="map"></div>
 
+  <audio id="scanner" controls style="position:absolute; right:14px; bottom:14px; z-index:600; background:var(--card); border:1px solid var(--edge); border-radius:12px; padding:6px;">
+    Your browser does not support audio.
+  </audio>
+
   <footer>
     <small>
-      This demo shows nearby <strong>police stations</strong> (from OpenStreetMap) and optional <strong>recent public safety incidents</strong> from open data portals when configured.
+      This demo shows nearby <strong>police stations</strong> (from OpenStreetMap) and optional <strong>recent public safety incidents</strong> from open data portals when configured. It can also play a <strong>public, lawfully accessible scanner stream</strong> you provide (audio only).
       It does <em>not</em> track real‑time officer locations. Your location never leaves the browser.
       Tiles © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OSM</a>.
     </small>
   </footer>
+
+  <details class="legend" style="left:auto; right:14px; bottom:64px; width:min(420px, 92vw)">
+    <summary><strong>About scanner audio</strong></summary>
+    <p>
+      This player accepts only <em>public, lawfully accessible</em> audio streams that permit third‑party playback. Do not use it to evade law enforcement or for any unlawful purpose. Some providers (e.g., radio portals) block embedding or require their own apps.
+    </p>
+    <p>
+      Tip: many official feeds are delayed (e.g., 15–30 minutes). That’s good for safety—this app is designed for <strong>general awareness</strong>, not real‑time tracking.
+    </p>
+  </details>
 
   <div class="legend" id="legend">
     <div>🛡️ Police stations</div>
@@ -85,7 +105,7 @@
     dataset: "",             // e.g., "kdmc-wqbf"
     appToken: "",           // optional Socrata app token for higher limits
     categoryField: "",      // e.g., "event_clearance_group" or "incident_category"
-    timeField: "",          // ISO date field name for filtering last 24h
+    timeField: "",          // ISO date field name for filtering (app enforces a >= 15 min delay)
     descriptionFields: []    // array of fields to show in popup
   };
 
@@ -105,11 +125,16 @@
   const locateBtn = document.getElementById('locate');
   const refreshBtn = document.getElementById('refresh');
   const radiusSel = document.getElementById('radius');
+  const scannerEl = document.getElementById('scanner');
+  const scannerUrlEl = document.getElementById('scannerUrl');
+  const scannerBtn = document.getElementById('scannerBtn');
 
   locateBtn.addEventListener('click', getLocation);
   refreshBtn.addEventListener('click', () => refreshData(lastPos));
+  scannerBtn.addEventListener('click', toggleScanner);
 
   let lastPos = null;
+  let playing = false;
 
   async function getLocation(){
     locateBtn.disabled = true;
@@ -128,7 +153,8 @@
       refreshBtn.disabled = false;
       await refreshData({ lat, lon });
     }catch(err){
-      alert('Could not get your location: ' + err.message + '\nTip: Use HTTPS and allow location access.');
+      alert('Could not get your location: ' + err.message + '
+Tip: Use HTTPS and allow location access.');
     }finally{
       locateBtn.textContent = 'Use my location';
       locateBtn.disabled = false;
@@ -151,7 +177,15 @@
   // =======================
   async function loadStations(center, radius){
     const { lat, lon } = center;
-    const query = `\n      [out:json][timeout:25];\n      (\n        node["amenity"="police"](around:${radius},${lat},${lon});\n        way["amenity"="police"](around:${radius},${lat},${lon});\n        relation["amenity"="police"](around:${radius},${lat},${lon});\n      );\n      out center;\n    `;
+    const query = `
+      [out:json][timeout:25];
+      (
+        node["amenity"="police"](around:${radius},${lat},${lon});
+        way["amenity"="police"](around:${radius},${lat},${lon});
+        relation["amenity"="police"](around:${radius},${lat},${lon});
+      );
+      out center;
+    `;
     try{
       const res = await fetch('https://overpass-api.de/api/interpreter', {
         method: 'POST',
@@ -179,20 +213,18 @@
   }
 
   // =======================
-  // Optional: Load recent incidents from a Socrata open data portal
+  // Optional: Load recent incidents (enforced ≥15 min delay)
   // =======================
   async function loadIncidents(center, radius){
     if (!INCIDENTS.enabled) return;
     const { lat, lon } = center;
-    const kilometers = radius / 1000;
-    const since = new Date(Date.now() - 24*3600*1000).toISOString();
+    const since = new Date(Date.now() - 15*60*1000).toISOString(); // enforce >= 15 min delay
 
     const base = `https://${INCIDENTS.domain}/resource/${INCIDENTS.dataset}.json`;
     const params = new URLSearchParams();
-    // Select fields (include location field as the last one, common names: location, point, geometry)
-    // We will try to infer the location field from common names.
+
     const where = [
-      INCIDENTS.timeField ? `${INCIDENTS.timeField} >= '${since}'` : '1=1',
+      INCIDENTS.timeField ? `${INCIDENTS.timeField} <= '${since}'` : '1=1', // only older than delay
       INCIDENTS.categoryField ? `${INCIDENTS.categoryField} IS NOT NULL` : '1=1'
     ].join(' AND ');
 
@@ -213,11 +245,42 @@
         INCIDENTS.descriptionFields.forEach(f => { if (r[f]) descParts.push(`<div>${escapeHtml(f)}: ${escapeHtml(String(r[f]))}</div>`); });
         L.marker([lat, lng], { icon: L.divIcon({ className: 'incident', html: '⚠️', iconSize: [16,16], iconAnchor:[8,8] }) })
           .addTo(incidentLayer)
-          .bindPopup(`<strong>⚠️ Incident</strong>${descParts.join('')}`);
+          .bindPopup(`<strong>⚠️ Incident (delayed)</strong>${descParts.join('')}`);
       });
     }catch(err){
       console.error(err);
       alert('Could not load incidents. Check configuration or rate limits.');
+    }
+  }
+
+  // =======================
+  // Scanner player (audio‑only)
+  // =======================
+  function toggleScanner(){
+    const url = (scannerUrlEl.value || '').trim();
+    if (!playing){
+      if (!url){
+        alert('Paste a public scanner stream URL that permits third‑party playback (often MP3/AAC).');
+        return;
+      }
+      try{
+        scannerEl.src = url; // must allow CORS; many portals block embedding
+        scannerEl.play().then(() => {
+          playing = true;
+          scannerBtn.textContent = 'Stop scanner';
+        }).catch(err => {
+          alert('Could not start audio: ' + err.message + '
+Tip: click the page first; some browsers require a gesture. Streams must allow cross‑origin playback.');
+        });
+      }catch(err){
+        alert('Invalid URL.');
+      }
+    } else {
+      scannerEl.pause();
+      scannerEl.currentTime = 0;
+      scannerEl.removeAttribute('src');
+      playing = false;
+      scannerBtn.textContent = 'Play scanner';
     }
   }
 
